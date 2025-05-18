@@ -1,86 +1,126 @@
+import math
+
 import serial
-import pandas as pd
-from datetime import datetime
-import time
+import csv
+from datetime import datetime, timedelta
+import os
 
-SERIAL_PORT = '/dev/ttyACM0'  # Update as needed
-BAUD_RATE = 9600
+# Configuration
 CSV_FILE = 'plates_log.csv'
-PARKING_RATE_PER_HOUR = 200  # RWF
+HOURLY_RATE = 200  # Example hourly rate (200 RWF per hour)
+MINIMUM_BALANCE = 500
 
-def load_csv():
-    return pd.read_csv(CSV_FILE)
+# Initialize serial connection
+ser = serial.Serial('COM14', 9600, timeout=1)
 
-def save_csv(df):
-    df.to_csv(CSV_FILE, index=False)
 
-def calculate_due(entry_time_str, exit_time):
-    entry_time = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S')
-    duration = exit_time - entry_time
-    hours = duration.total_seconds() / 3600
-    hours_rounded = int(hours) if hours == int(hours) else int(hours) + 1  # Round up partial hours
-    due = hours_rounded * PARKING_RATE_PER_HOUR
-    return due, hours_rounded
+def calculate_charges(plate_number):
+    """Calculate charges based on unpaid hours from CSV entries"""
+    unpaid_hours = 0
+    current_time = datetime.now()
+
+    with open(CSV_FILE, 'r') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            if row['Plate Number'] == plate_number and row['Payment Status'] == '0':
+                try:
+                    entry_time = datetime.strptime(row['Timestamp'], '%Y-%m-%d %H:%M:%S')
+                    duration = current_time - entry_time
+                    hours = math.ceil(duration.total_seconds() / 3600)  # Round up to nearest hour
+                    unpaid_hours += hours
+                except ValueError:
+                    continue
+
+    total_charge = unpaid_hours * HOURLY_RATE
+    return total_charge, unpaid_hours
+
+
+def update_csv(plate_number):
+    """Update payment status for calculated hours"""
+    updated_rows = []
+
+    with open(CSV_FILE, 'r') as file:
+        reader = csv.DictReader(file)
+        fieldnames = reader.fieldnames
+        for row in reader:
+            if row['Plate Number'] == plate_number and row['Payment Status'] == '0':
+                row['Payment Status'] = '1'  # Mark as paid
+            updated_rows.append(row)
+
+    with open(CSV_FILE, 'w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(updated_rows)
+
+
+def process_payment(plate_number, current_balance):
+    try:
+        total_charge, hours = calculate_charges(plate_number)
+
+        if hours == 0:
+            return "NO_PENDING_HOURS", current_balance
+
+        if current_balance < total_charge:
+            return f"INSUFFICIENT_FUNDS: Need {total_charge}, have {current_balance}", current_balance
+
+        new_balance = current_balance - total_charge
+        update_csv(plate_number)
+
+        return "SUCCESS", new_balance
+
+    except Exception as e:
+        return f"PROCESSING_ERROR: {str(e)}", current_balance
+
 
 def main():
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)  # Wait for Arduino reset
-
-    print("Waiting for plate number from Arduino...")
+    print("Payment System Running. Waiting for RFID scans...")
 
     while True:
-        line = ser.readline().decode('utf-8').strip()
-        if line.startswith("PLATE:"):
-            plate = line.split("PLATE:")[1].strip()
-            print(f"Received plate: {plate}")
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8').strip()
 
-            df = load_csv()
-            row_idx = df.index[df['Plate Number'] == plate].tolist()
+                if line.startswith("PROCESS_PAYMENT:"):
+                    # Extract plate number and balance
+                    data = line[len("PROCESS_PAYMENT:"):].split(',')
+                    if len(data) == 2:
+                        plate_number = data[0]
+                        current_balance = int(data[1])
 
-            if not row_idx:
-                print(f"Plate {plate} not found in CSV.")
-                ser.write(b"STATUS:NOT_FOUND\n")
-                continue
+                        # Process payment
+                        status, new_balance = process_payment(plate_number, current_balance)
 
-            idx = row_idx[0]
-            status = df.at[idx, 'Payment Status']
-            entry_time_str = df.at[idx, 'Timestamp']
+                        # Send response back to Arduino
+                        if status == "SUCCESS":
+                            ser.write(f"NEW_BALANCE:{new_balance}\n".encode())
+                        else:
+                            ser.write(f"ERROR:{status}\n".encode())
 
-            if status == 1:
-                print(f"Plate {plate} already paid.")
-                ser.write(b"STATUS:PAID\n")
-                continue
+                        # Log transaction
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        log_entry = f"{timestamp} - {plate_number} - Status: {status}, Old Balance: {current_balance}, New Balance: {new_balance}\n"
+                        print(log_entry)
+                        with open('payment_log.txt', 'a') as log_file:
+                            log_file.write(log_entry)
 
-            # status == 0, unpaid - process payment
-            exit_time = datetime.now()
-            due_amount, hours_parked = calculate_due(entry_time_str, exit_time)
+                elif line.startswith("INSUFFICIENT_BALANCE:"):
+                    balance = line[len("INSUFFICIENT_BALANCE:"):]
+                    print(f"Insufficient balance detected: {balance}")
 
-            print(f"Hours parked: {hours_parked}, Due amount: {due_amount} RWF")
+        except KeyboardInterrupt:
+            print("\nShutting down payment system...")
+            ser.close()
+            break
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            continue
 
-            # Update CSV with exit_time and due_amount, keep status=0 (unpaid)
-            df.at[idx, 'Exit Time'] = exit_time.strftime('%Y-%m-%d %H:%M:%S')
-            df.at[idx, 'Due Amount'] = due_amount
-            save_csv(df)
-
-            # Send due amount to Arduino for deduction
-            ser.write(f"DUE:{due_amount}\n".encode())
-            print("Sent due amount to Arduino, waiting for confirmation...")
-
-            # Wait for Arduino confirmation: either "DONE" or "INSUFFICIENT"
-            confirmation = ser.readline().decode('utf-8').strip()
-            if confirmation == "DONE":
-                print("Payment confirmed by Arduino. Updating status to PAID.")
-                df.at[idx, 'Payment Status'] = 1  # Paid
-                save_csv(df)
-                ser.write(b"STATUS:PAID\n")
-            elif confirmation == "INSUFFICIENT":
-                print("Insufficient balance on card. Payment failed.")
-                ser.write(b"STATUS:INSUFFICIENT\n")
-            else:
-                print("Payment not confirmed by Arduino.")
-                ser.write(b"STATUS:FAILED\n")
-
-        time.sleep(0.1)
 
 if __name__ == "__main__":
+    # Create CSV file if it doesn't exist
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Plate Number', 'Payment Status', 'Timestamp'])
+
     main()

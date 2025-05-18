@@ -1,12 +1,14 @@
 import cv2
 from ultralytics import YOLO
-import pytesseract
 import os
 import time
 import serial
 import serial.tools.list_ports
 import csv
 from collections import Counter
+
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
 
 # Load YOLOv8 model
 model = YOLO('best.pt')
@@ -26,7 +28,7 @@ if not os.path.exists(csv_file):
 def detect_arduino_port():
     ports = list(serial.tools.list_ports.comports())
     for port in ports:
-        if "usbmodem" in port.device or "wchusbmodem" in port.device:
+        if "COM15" in port.device or "wchusbmodem" in port.device:
             return port.device
     return None
 
@@ -61,7 +63,7 @@ while True:
     distance = mock_ultrasonic_distance()
     print(f"[SENSOR] Distance: {distance} cm")
 
-    if distance <= 50:
+    if distance <= 150:
         results = model(frame)
 
         for result in results:
